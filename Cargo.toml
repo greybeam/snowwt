@@ -2,7 +2,14 @@
 name = "snowwt"
 version = "0.1.0"
 edition = "2024"
+keywords = ["snowflake", "jwt", "auth", "login"]
+categories = ["authentication"]
+homepage = "https://github.com/greybeam/snowwt"
+repository = "https://github.com/greybeam/snowwt"
+authors = ["Alexander Hall <alexander@greybeam.ai>"]
+description = "Snowflake JWT+Login parameter generator"
 license = "Apache-2.0 OR MIT"
+# Subject to change
 rust-version = "1.85"
 
 [lints]
