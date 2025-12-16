@@ -10,14 +10,12 @@
 
 extern crate alloc;
 
-use alloc::{borrow::Cow, string::String};
+use alloc::{borrow::Cow, boxed::Box, string::String};
 
 use base64::Engine;
 use jsonwebtoken::{EncodingKey, Header};
-use rsa::{
-    pkcs1::EncodeRsaPrivateKey,
-    pkcs8::{DecodePrivateKey, spki::EncodePublicKey},
-};
+use pkcs8::EncodePublicKey;
+use rsa::{pkcs1::EncodeRsaPrivateKey, pkcs8::DecodePrivateKey};
 
 pub use rsa;
 pub use secrecy;
@@ -26,29 +24,70 @@ use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretSlice, SecretStrin
 use sha2::Digest;
 
 /// Arguments for keypair auth.
+///
+/// Internally, this consists of an rsa private key and a derived jsonwebtoken
+/// encoding key, for performance on its primary task.
 pub struct KeypairAuth {
-    /// optional password for encrypted keys
-    pub password: Option<SecretSlice<u8>>,
-    /// private key data in pkcs8 pem format
-    pub private_key_p8: SecretString,
+    /// Decoded form
+    private_key: Box<rsa::RsaPrivateKey>,
+    /// encoding key used by jwt
+    encoding_key: EncodingKey,
+}
+
+/// Returns the [`jsonwebtoken::EncodingKey`] for a given [`rsa::RsaPrivateKey`].
+pub fn encoding_key_for(pkey: &rsa::RsaPrivateKey) -> Result<EncodingKey, Error> {
+    Ok(EncodingKey::from_rsa_der(pkey.to_pkcs1_der()?.as_bytes()))
 }
 
 impl KeypairAuth {
-    /// Parses the private key from this KeypairAuth
-    pub fn private_key(&self) -> Result<rsa::RsaPrivateKey, rsa::pkcs8::Error> {
-        match self {
-            KeypairAuth {
-                password: Some(password),
-                private_key_p8,
-            } => rsa::RsaPrivateKey::from_pkcs8_encrypted_pem(
+    /// Constructs a new keypair, decoding it.
+    ///
+    /// For higher security passwords this function can take seconds to terminate.
+    pub fn new(
+        password: Option<SecretSlice<u8>>,
+        private_key_p8: SecretString,
+    ) -> Result<Self, Error> {
+        let mut pkey = match password {
+            Some(password) => rsa::RsaPrivateKey::from_pkcs8_encrypted_pem(
                 private_key_p8.expose_secret(),
                 password.expose_secret(),
-            ),
-            KeypairAuth {
-                password: None,
-                private_key_p8,
-            } => rsa::RsaPrivateKey::from_pkcs8_pem(private_key_p8.expose_secret()),
-        }
+            )?,
+
+            None => rsa::RsaPrivateKey::from_pkcs8_pem(private_key_p8.expose_secret())?,
+        };
+
+        pkey.precompute()?;
+
+        let ek = encoding_key_for(&pkey)?;
+
+        Ok(Self {
+            private_key: Box::new(pkey),
+            encoding_key: ek,
+        })
+    }
+
+    /// Constructs a new KeypairAuth from a pre-parsed private key.
+    ///
+    /// This will attempt to precompute rsa values regardless, which could take a while
+    pub fn from_private_key(mut pkey: rsa::RsaPrivateKey) -> Result<Self, Error> {
+        pkey.precompute()?;
+
+        let ek = encoding_key_for(&pkey)?;
+
+        Ok(Self {
+            private_key: Box::new(pkey),
+            encoding_key: ek,
+        })
+    }
+
+    /// Returns the private key in this KeypairAuth
+    pub fn private_key(&self) -> &rsa::RsaPrivateKey {
+        &self.private_key
+    }
+
+    /// Returns the derived EncodingKey for this KeypairAuth
+    pub fn encoding_key(&self) -> &EncodingKey {
+        &self.encoding_key
     }
 }
 
@@ -138,14 +177,13 @@ impl<AccountTy: AsRef<str>, UsernameTy: AsRef<str>> LoginCredentials<AccountTy, 
                 Cow::Borrowed(secret_box.expose_secret()),
             ),
             LoginAuth::Keypair(keypair) => {
-                let private = keypair.private_key()?;
                 // make a secretbox so its cleared on drop
                 let mut scratch = SecretBox::default();
 
                 let jwt = generate_jwt(
                     self.account.as_ref(),
                     self.username.as_ref(),
-                    &private,
+                    keypair,
                     now,
                     expire,
                     scratch.expose_secret_mut(),
@@ -216,6 +254,9 @@ pub enum Error {
     /// jsonwebtoken serialization error
     #[error(transparent)]
     Jwt(#[from] jsonwebtoken::errors::Error),
+    /// RSA compute error
+    #[error(transparent)]
+    Rsa(#[from] rsa::Error),
 }
 
 /// Typed repr for unix seconds.
@@ -255,7 +296,7 @@ pub struct IssSub<'a> {
 pub fn make_iss<'out>(
     account: &str,
     username: &str,
-    pubkey: &rsa::RsaPublicKey,
+    pubkey: &impl EncodePublicKey,
     out: &'out mut String,
 ) -> Result<IssSub<'out>, Error> {
     const ACCOUNT_USERNAME_SPLIT: &str = ".";
@@ -296,12 +337,12 @@ pub fn make_iss<'out>(
 ///
 /// # Examples
 /// ```
-/// # use snowwt::{generate_jwt, UnixSeconds, JwtClaims};
+/// # use snowwt::{generate_jwt, UnixSeconds, JwtClaims, KeypairAuth};
 /// # use rsa::{
 /// #  pkcs1::EncodeRsaPrivateKey,
 /// #  pkcs8::{DecodePrivateKey, spki::EncodePublicKey},
 /// # };
-/// let privkey = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).expect("a");
+/// let privkey = KeypairAuth::from_private_key(rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).expect("a")).expect("z");
 ///
 /// let jwt = generate_jwt(
 ///     "grey", "beam",
@@ -321,6 +362,7 @@ pub fn make_iss<'out>(
 ///
 /// let key = jsonwebtoken::DecodingKey::from_rsa_pem(
 ///     privkey
+///         .private_key()
 ///         .to_public_key()
 ///         .to_public_key_pem(Default::default())
 ///         .expect("c")
@@ -338,12 +380,17 @@ pub fn make_iss<'out>(
 pub fn generate_jwt(
     account: &str,
     username: &str,
-    auth: &rsa::RsaPrivateKey,
+    auth: &KeypairAuth,
     now: UnixSeconds,
     expire: UnixSeconds,
     scratch: &mut String,
 ) -> Result<String, Error> {
-    let IssSub { iss, sub } = make_iss(account, username, &auth.to_public_key(), scratch)?;
+    let IssSub { iss, sub } = make_iss(
+        account,
+        username,
+        &auth.private_key().to_public_key(),
+        scratch,
+    )?;
 
     let claim = JwtClaims {
         exp: expire,
@@ -352,9 +399,11 @@ pub fn generate_jwt(
         sub,
     };
 
-    let ek = EncodingKey::from_rsa_der(auth.to_pkcs1_der()?.as_bytes());
-
-    let s = jsonwebtoken::encode(&Header::new(jsonwebtoken::Algorithm::RS256), &claim, &ek)?;
+    let s = jsonwebtoken::encode(
+        &Header::new(jsonwebtoken::Algorithm::RS256),
+        &claim,
+        auth.encoding_key(),
+    )?;
 
     Ok(s)
 }
