@@ -12,12 +12,11 @@ rust.missing_docs = "warn"
 [dependencies]
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 jsonwebtoken = { version = "10.2.0", default-features = false, features = [
-  "rust_crypto", "use_pem"
+  "rust_crypto",
+  "use_pem",
 ] }
-pkcs8 = { version = "0.10.2", default-features = false, features = [
-  "encryption",
-] }
-rsa = { version = "0.9.9", default-features = false }
+pkcs8 = { version = "0.10.2", features = ["encryption"] }
+rsa = "0.9.9"
 secrecy = { version = "0.10.3", default-features = false }
 serde = { version = "1.0.228", default-features = false }
 serde_derive = { version = "1.0.228", default-features = false }
